@@ -1,0 +1,9 @@
+[submodule "libuvc"]
+	path = libuvc
+	url = git@github.com:libuvc/libuvc.git
+[submodule "libuvc-theta-sample"]
+	path = libuvc-theta-sample
+	url = git@github.com:ricohapi/libuvc-theta-sample.git
+[submodule "libuvc-theta"]
+	path = libuvc-theta
+	url = git@github.com:ricohapi/libuvc-theta.git
