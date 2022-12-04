@@ -38,7 +38,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        let mode = Mode::Uhd;
+        let mode = Mode::Fhd;
         let (mut width, mut height, mut fps) = (0, 0, 0);
         
         if let Some(preset) = mode.get_mode_settings() {
@@ -88,8 +88,7 @@ impl Default for State {
 
 pub struct ThetaUvc {
     settings: Mutex<Settings>,
-    state: Arc<Mutex<State>>,
-    cv: Condvar,
+    state: Arc<(Mutex<State>, Condvar)>,
 }
 
 #[glib::object_subclass]
@@ -103,8 +102,7 @@ impl ObjectSubclass for ThetaUvc {
     fn new() -> Self {
         Self {
             settings: Mutex::new(Settings::default()),
-            state: Arc::new(Mutex::new(State::default())),
-            cv: Condvar::new(),
+            state: Arc::new((Mutex::new(State::default()), Condvar::new()))
         }
     }
 }
@@ -150,7 +148,7 @@ impl ObjectImpl for ThetaUvc {
     fn constructed(&self) {
         self.parent_constructed();
         let obj = self.instance();
-        obj.set_live(true);
+        // obj.set_live(true);
         obj.set_format(gstreamer::Format::Time);
     }
 
@@ -278,7 +276,9 @@ impl ElementImpl for ThetaUvc {
                 "src",
                 gstreamer::PadDirection::Src,
                 gstreamer::PadPresence::Always,
-                &gstreamer::Caps::builder("video/x-h264").build(),
+                &gstreamer::Caps::builder("video/x-h264")
+                    .field("stream-format", "byte-stream")
+                    .build(),
             )
             .unwrap();
             vec![src_pad_template]
@@ -338,7 +338,8 @@ impl ElementImpl for ThetaUvc {
                         gstreamer::StateChangeError
                     })?;
                 if let Some(device) = device.into_iter().nth(settings.device_index as usize) {
-                    let mut state = self.state.lock().unwrap();
+                    let (state, _) = &*self.state;
+                    let mut state = state.lock().unwrap();
                     state.device.replace(Arc::new(device));
                 } else {
                     gstreamer::element_imp_error!(
@@ -350,7 +351,8 @@ impl ElementImpl for ThetaUvc {
                 }
             }
             gstreamer::StateChange::ReadyToNull => {
-                let mut state = self.state.lock().unwrap();
+                let (state, _) = &*self.state;
+                let mut state = state.lock().unwrap();
                 state.device.take();
             }
             _ => (),
@@ -372,7 +374,12 @@ impl BaseSrcImpl for ThetaUvc {
     }
 
     fn caps(&self, filter: Option<&gstreamer::Caps>) -> Option<gstreamer::Caps> {
-        let caps = gstreamer::Caps::builder("video/x-h264").build();
+        let settings = self.settings.lock().unwrap();
+        let caps = gstreamer::Caps::builder("video/x-h264")
+            .field("framerate", gstreamer::Fraction::new((settings.fps * 1000) as i32, 1001))
+            .field("stream-format", "byte-stream")
+            .field("profile", "constrained-baseline")
+            .build();
         if let Some(filter) = filter {
             if filter.can_intersect(&caps) {
                 Some(caps)
@@ -390,7 +397,8 @@ impl BaseSrcImpl for ThetaUvc {
             settings.clone()
         };
         
-        let mut state = self.state.lock().unwrap();
+        let (state, _) = &*self.state;
+        let mut state = state.lock().unwrap();
         let device = state.device.as_ref().ok_or_else(|| {
             gstreamer::error_msg!(
                 gstreamer::LibraryError::Init,
@@ -400,6 +408,9 @@ impl BaseSrcImpl for ThetaUvc {
         let device_handle = device
             .open()
             .map_err(|err| gstreamer::error_msg!(gstreamer::LibraryError::Init, ("{:#?}", err)))?;
+        
+        gstreamer::info!(CAT, imp: self, "Starting camera stream with width={},height={},fps={}", settings.width, settings.height, settings.fps);
+
         let stream_handle = device_handle.start_streaming(
             settings.width as usize,
             settings.height as usize,
@@ -414,7 +425,8 @@ impl BaseSrcImpl for ThetaUvc {
     }
 
     fn stop(&self) -> Result<(), gstreamer::ErrorMessage> {
-        let mut state = self.state.lock().unwrap();
+        let (state, _) = &*self.state;
+        let mut state = state.lock().unwrap();
         state.device.take();
         state.frame.take();
         Ok(())
@@ -426,12 +438,15 @@ impl PushSrcImpl for ThetaUvc {
         &self,
         _buffer: Option<&mut gstreamer::BufferRef>,
     ) -> Result<CreateSuccess, gstreamer::FlowError> {
-        let mut state = self.state.lock().unwrap();
+        let (state, cv) = &*self.state;
+        let mut state = state.lock().unwrap();
         loop {
             if let Some(buffer) = state.frame.take() {
+                gstreamer::debug!(CAT, imp: self, "Got frame from camera. pts={:#?}, dts={:#?}, duration={:#?}", buffer.as_ref().pts(), buffer.as_ref().dts(), buffer.as_ref().duration());
                 return Ok(CreateSuccess::NewBuffer(buffer))
             }
-            state = self.cv.wait(state).unwrap();
+            gstreamer::debug!(CAT, imp: self, "Sleeping until next frame");
+            state = cv.wait(state).unwrap();
         }
     }
 }
@@ -469,20 +484,26 @@ impl Mode {
     }
 }
 
-fn on_frame_callback(frame: UvcFrame, state: &mut Weak<Mutex<State>>) {
+fn on_frame_callback(frame: UvcFrame, state: &mut Weak<(Mutex<State>, Condvar)>) {
     let Some(state) = state.upgrade() else {
         return;
     };
+    let (state, cv) = &*state;
     let mut state = state.lock().unwrap();
+
+    gstreamer::debug!(CAT, "Creating buffer for frame");
     
-    let mut buffer = gstreamer::Buffer::from_mut_slice(frame.data().to_vec());
+    let mut buffer = gstreamer::Buffer::with_size(frame.data().len()).unwrap();
+    buffer.make_mut().map_writable().unwrap().as_mut_slice().copy_from_slice(frame.data());
 
     let frame_interval = state.stream.as_ref().unwrap().frame_interval().as_nanos() as u64;
-    let pts = gstreamer::ClockTime::from_useconds(frame_interval * frame.sequence() as u64);
+    let pts = gstreamer::ClockTime::from_nseconds(frame_interval * frame.sequence() as u64);
     buffer.make_mut().set_pts(Some(pts));
     buffer.make_mut().set_dts(None);
-    buffer.make_mut().set_duration(Some(gstreamer::ClockTime::from_useconds(frame_interval)));
+    buffer.make_mut().set_duration(Some(gstreamer::ClockTime::from_nseconds(frame_interval)));
+    buffer.make_mut().set_offset(frame.sequence() as u64);
     state.frame.replace(buffer);
+    cv.notify_one();
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy, glib::Enum)]

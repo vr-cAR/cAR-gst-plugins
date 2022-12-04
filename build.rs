@@ -1,13 +1,20 @@
 use std::{env, path::PathBuf};
 
 fn main() {
-    let dst = cmake::build("libuvc-theta");
+    let dst = cmake::Config::new("libuvc-theta")
+        .define("CMAKE_BUILD_TARGET", "Static")
+        .define("BUILD_EXAMPLE", "OFF")
+        .define("CMAKE_BUILD_TYPE", "Release")
+        .build();
 
-    println!("cargo:rustc-link-search=native={}", dst.display());
+    println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
     println!("cargo:rustc-link-lib=static=uvc");
+    println!("cargo:rustc-link-lib=usb-1.0");
+
 
     let bindings = bindgen::Builder::default()
-        .header("libuvc-theta/include/libuvc/libuvc.h")
+        .header(dst.join("include/libuvc/libuvc.h").into_os_string().into_string().unwrap())
+        .clang_arg(format!("-I{}", dst.join("include").into_os_string().into_string().unwrap()))
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: true,
         })

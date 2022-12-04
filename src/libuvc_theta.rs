@@ -97,7 +97,7 @@ impl UvcDeviceWrapper {
         Self { dev, _owner: ctx }
     }
 
-    pub unsafe fn open(&self) -> Result<UvcDeviceHandle, sys::uvc_error> {
+    pub unsafe fn open(self: Arc<Self>) -> Result<UvcDeviceHandle, sys::uvc_error> {
         Ok(UvcDeviceHandle::new(UvcDeviceHandleWrapper::new(self)?))
     }
 }
@@ -124,23 +124,25 @@ impl UvcDevice {
     }
 
     pub fn open(&self) -> Result<UvcDeviceHandle, sys::uvc_error> {
-        unsafe { self.inner.open() }
+        unsafe { self.inner.clone().open() }
     }
 }
 
 struct UvcDeviceHandleWrapper {
     handle: NonNull<sys::uvc_device_handle>,
     streams: Mutex<Vec<Box<PossibleStream>>>,
+    _owner: Arc<UvcDeviceWrapper>,
 }
 
 impl UvcDeviceHandleWrapper {
-    unsafe fn new(device: &UvcDeviceWrapper) -> Result<Self, sys::uvc_error> {
+    unsafe fn new(device: Arc<UvcDeviceWrapper>) -> Result<Self, sys::uvc_error> {
         let mut handle_ptr = MaybeUninit::<*mut sys::uvc_device_handle>::uninit();
         match sys::uvc_open(device.dev.as_ptr(), handle_ptr.as_mut_ptr()) {
             sys::uvc_error::UVC_SUCCESS => {
                 Ok(Self {
                     handle: NonNull::new(handle_ptr.assume_init()).unwrap(),
                     streams: Mutex::new(Vec::new()),
+                    _owner: device,
                 })
             },
             err => {
