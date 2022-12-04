@@ -1,8 +1,5 @@
-use std::sync::{Mutex, Condvar, Weak};
-use std::{
-    str::FromStr,
-    sync::Arc,
-};
+use std::sync::{Condvar, Mutex, Weak};
+use std::{str::FromStr, sync::Arc};
 
 use gstreamer::subclass::prelude::*;
 use gstreamer::{glib, prelude::*};
@@ -40,7 +37,7 @@ impl Default for Settings {
     fn default() -> Self {
         let mode = Mode::Fhd;
         let (mut width, mut height, mut fps) = (0, 0, 0);
-        
+
         if let Some(preset) = mode.get_mode_settings() {
             width = preset.width;
             height = preset.height;
@@ -102,7 +99,7 @@ impl ObjectSubclass for ThetaUvc {
     fn new() -> Self {
         Self {
             settings: Mutex::new(Settings::default()),
-            state: Arc::new((Mutex::new(State::default()), Condvar::new()))
+            state: Arc::new((Mutex::new(State::default()), Condvar::new())),
         }
     }
 }
@@ -205,15 +202,15 @@ impl ObjectImpl for ThetaUvc {
                     SettingField::Width => {
                         set_field!(settings.width);
                         set_field!(enum settings.mode, Mode::NoMode);
-                    },
+                    }
                     SettingField::Height => {
                         set_field!(settings.height);
                         set_field!(enum settings.mode, Mode::NoMode);
-                    },
+                    }
                     SettingField::Fps => {
                         set_field!(settings.fps);
                         set_field!(enum settings.mode, Mode::NoMode);
-                    },
+                    }
                     SettingField::Mode => {
                         set_field!(enum settings.mode);
                         if let Some(preset) = settings.mode.get_mode_settings() {
@@ -221,7 +218,7 @@ impl ObjectImpl for ThetaUvc {
                             set_field!(settings.height, preset.height);
                             set_field!(settings.fps, preset.fps);
                         }
-                    },
+                    }
                     SettingField::Product => set_field!(enum settings.product),
                     SettingField::DeviceIndex => set_field!(settings.device_index),
                     SettingField::SerialNumber => set_field!(settings.serial_number),
@@ -300,7 +297,7 @@ impl ElementImpl for ThetaUvc {
                     gstreamer::element_imp_error!(
                         self,
                         gstreamer::LibraryError::Init,
-                        ("{:#?}", err)
+                        ("Could not create a libuvc context. Error: {:#?}", err)
                     );
                     gstreamer::StateChangeError
                 })?;
@@ -310,30 +307,38 @@ impl ElementImpl for ThetaUvc {
                     Product::Z1 => Some(USBPID_THETAZ1_UVC),
                     Product::V => Some(USBPID_THETAV_UVC),
                     Product::AnyProduct => None,
-                }.map(|i| i as i32);
+                }
+                .map(|i| i as i32);
                 let serial_number = match settings.serial_number.as_str() {
                     "" => None,
                     sn => Some(sn),
                 };
-                let device = context.find_devices(vid, pid, serial_number)
+                let device = context
+                    .find_devices(vid, pid, serial_number)
                     .map_err(|err| {
                         gstreamer::element_imp_error!(
                             self,
                             gstreamer::LibraryError::Init,
-                            ("Could not find device {}. Error: {:#?}", 
+                            (
+                                "Could not find device {}. Error: {:#?}",
                                 [
-                                    ("vid", vid.map(|vid| vid.to_string())), 
-                                    ("pid", pid.map(|pid| pid.to_string())), 
+                                    ("vid", vid.map(|vid| vid.to_string())),
+                                    ("pid", pid.map(|pid| pid.to_string())),
                                     ("serial number", serial_number.map(|sn| sn.to_owned()))
                                 ]
                                 .into_iter()
-                                .map(|(name, val)| format!("{} = {}", name, match val {
-                                    Some(val) => val,
-                                    None => "<any>".to_owned()
-                                }))
+                                .map(|(name, val)| format!(
+                                    "{} = {}",
+                                    name,
+                                    match val {
+                                        Some(val) => val,
+                                        None => "<any>".to_owned(),
+                                    }
+                                ))
                                 .collect::<Vec<_>>()
-                                .join(",")
-                            , err)
+                                .join(","),
+                                err
+                            )
                         );
                         gstreamer::StateChangeError
                     })?;
@@ -345,7 +350,7 @@ impl ElementImpl for ThetaUvc {
                     gstreamer::element_imp_error!(
                         self,
                         gstreamer::LibraryError::Init,
-                        ("Could not find a compatible device")
+                        ("Provided device index {} greater than the number of devices that exist that meets the requested specifications", settings.device_index)
                     );
                     return Err(gstreamer::StateChangeError);
                 }
@@ -376,7 +381,10 @@ impl BaseSrcImpl for ThetaUvc {
     fn caps(&self, filter: Option<&gstreamer::Caps>) -> Option<gstreamer::Caps> {
         let settings = self.settings.lock().unwrap();
         let caps = gstreamer::Caps::builder("video/x-h264")
-            .field("framerate", gstreamer::Fraction::new((settings.fps * 1000) as i32, 1001))
+            .field(
+                "framerate",
+                gstreamer::Fraction::new((settings.fps * 1000) as i32, 1001),
+            )
             .field("stream-format", "byte-stream")
             .field("profile", "constrained-baseline")
             .build();
@@ -396,7 +404,7 @@ impl BaseSrcImpl for ThetaUvc {
             let settings = self.settings.lock().unwrap();
             settings.clone()
         };
-        
+
         let (state, _) = &*self.state;
         let mut state = state.lock().unwrap();
         let device = state.device.as_ref().ok_or_else(|| {
@@ -408,17 +416,30 @@ impl BaseSrcImpl for ThetaUvc {
         let device_handle = device
             .open()
             .map_err(|err| gstreamer::error_msg!(gstreamer::LibraryError::Init, ("{:#?}", err)))?;
-        
-        gstreamer::info!(CAT, imp: self, "Starting camera stream with width={},height={},fps={}", settings.width, settings.height, settings.fps);
 
-        let stream_handle = device_handle.start_streaming(
-            settings.width as usize,
-            settings.height as usize,
-            settings.fps as usize,
-            on_frame_callback,
-            Arc::downgrade(&self.state.clone()),
-        )
-        .map_err(|err| gstreamer::error_msg!(gstreamer::LibraryError::Init, ("{:#?}", err)))?;
+        gstreamer::info!(
+            CAT,
+            imp: self,
+            "Starting camera stream with width={},height={},fps={}",
+            settings.width,
+            settings.height,
+            settings.fps
+        );
+
+        let stream_handle = device_handle
+            .start_streaming(
+                settings.width as usize,
+                settings.height as usize,
+                settings.fps as usize,
+                on_frame_callback,
+                Arc::downgrade(&self.state.clone()),
+            )
+            .map_err(|err| {
+                gstreamer::error_msg!(
+                    gstreamer::LibraryError::Init,
+                    ("Cannot open device to begin streaming. Error: {:#?}", err)
+                )
+            })?;
         state.stream.replace(stream_handle);
 
         Ok(())
@@ -442,8 +463,15 @@ impl PushSrcImpl for ThetaUvc {
         let mut state = state.lock().unwrap();
         loop {
             if let Some(buffer) = state.frame.take() {
-                gstreamer::debug!(CAT, imp: self, "Got frame from camera. pts={:#?}, dts={:#?}, duration={:#?}", buffer.as_ref().pts(), buffer.as_ref().dts(), buffer.as_ref().duration());
-                return Ok(CreateSuccess::NewBuffer(buffer))
+                gstreamer::debug!(
+                    CAT,
+                    imp: self,
+                    "Got frame from camera. pts={:#?}, dts={:#?}, duration={:#?}",
+                    buffer.as_ref().pts(),
+                    buffer.as_ref().dts(),
+                    buffer.as_ref().duration()
+                );
+                return Ok(CreateSuccess::NewBuffer(buffer));
             }
             gstreamer::debug!(CAT, imp: self, "Sleeping until next frame");
             state = cv.wait(state).unwrap();
@@ -492,15 +520,22 @@ fn on_frame_callback(frame: UvcFrame, state: &mut Weak<(Mutex<State>, Condvar)>)
     let mut state = state.lock().unwrap();
 
     gstreamer::debug!(CAT, "Creating buffer for frame");
-    
+
     let mut buffer = gstreamer::Buffer::with_size(frame.data().len()).unwrap();
-    buffer.make_mut().map_writable().unwrap().as_mut_slice().copy_from_slice(frame.data());
+    buffer
+        .make_mut()
+        .map_writable()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(frame.data());
 
     let frame_interval = state.stream.as_ref().unwrap().frame_interval().as_nanos() as u64;
     let pts = gstreamer::ClockTime::from_nseconds(frame_interval * frame.sequence() as u64);
     buffer.make_mut().set_pts(Some(pts));
     buffer.make_mut().set_dts(None);
-    buffer.make_mut().set_duration(Some(gstreamer::ClockTime::from_nseconds(frame_interval)));
+    buffer
+        .make_mut()
+        .set_duration(Some(gstreamer::ClockTime::from_nseconds(frame_interval)));
     buffer.make_mut().set_offset(frame.sequence() as u64);
     state.frame.replace(buffer);
     cv.notify_one();

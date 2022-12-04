@@ -1,4 +1,11 @@
-use std::{ffi::CString, mem::MaybeUninit, os::raw::c_void, ptr::NonNull, sync::{Arc, Mutex}, time::Duration};
+use std::{
+    ffi::CString,
+    mem::MaybeUninit,
+    os::raw::c_void,
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use self::sys::uvc_stream_ctrl_t;
 
@@ -10,7 +17,9 @@ impl UvcContextWrapper {
     unsafe fn new() -> Result<Self, sys::uvc_error_t> {
         let mut ctx = std::ptr::null_mut();
         match sys::uvc_init((&mut ctx) as *mut _, std::ptr::null_mut()) {
-            sys::uvc_error_t::UVC_SUCCESS => Ok(Self { ctx: NonNull::new(ctx).unwrap() }),
+            sys::uvc_error_t::UVC_SUCCESS => Ok(Self {
+                ctx: NonNull::new(ctx).unwrap(),
+            }),
             err => Err(err),
         }
     }
@@ -22,7 +31,9 @@ impl UvcContextWrapper {
         serial_number: Option<&str>,
     ) -> Result<Vec<UvcDevice>, sys::uvc_error_t> {
         let mut device_ptr_arr = MaybeUninit::<*mut *mut sys::uvc_device>::uninit();
-        let serial_number = serial_number.as_ref().map(|sn| CString::new(sn.as_bytes()).unwrap());
+        let serial_number = serial_number
+            .as_ref()
+            .map(|sn| CString::new(sn.as_bytes()).unwrap());
 
         match sys::uvc_find_devices(
             self.ctx.as_ptr(),
@@ -40,9 +51,10 @@ impl UvcContextWrapper {
                 for i in 0.. {
                     let device_ptr = *device_ptr_slice.offset(i).as_ref().unwrap();
                     match NonNull::new(device_ptr) {
-                        Some(device_ptr) => devices.push(
-                            UvcDevice::new(UvcDeviceWrapper::new(device_ptr, self.clone()))
-                        ),
+                        Some(device_ptr) => devices.push(UvcDevice::new(UvcDeviceWrapper::new(
+                            device_ptr,
+                            self.clone(),
+                        ))),
                         None => {
                             break;
                         }
@@ -119,7 +131,7 @@ pub struct UvcDevice {
 impl UvcDevice {
     fn new(wrapper: UvcDeviceWrapper) -> Self {
         Self {
-            inner: Arc::new(wrapper)
+            inner: Arc::new(wrapper),
         }
     }
 
@@ -138,34 +150,37 @@ impl UvcDeviceHandleWrapper {
     unsafe fn new(device: Arc<UvcDeviceWrapper>) -> Result<Self, sys::uvc_error> {
         let mut handle_ptr = MaybeUninit::<*mut sys::uvc_device_handle>::uninit();
         match sys::uvc_open(device.dev.as_ptr(), handle_ptr.as_mut_ptr()) {
-            sys::uvc_error::UVC_SUCCESS => {
-                Ok(Self {
-                    handle: NonNull::new(handle_ptr.assume_init()).unwrap(),
-                    streams: Mutex::new(Vec::new()),
-                    _owner: device,
-                })
-            },
-            err => {
-                Err(err)
-            }
+            sys::uvc_error::UVC_SUCCESS => Ok(Self {
+                handle: NonNull::new(handle_ptr.assume_init()).unwrap(),
+                streams: Mutex::new(Vec::new()),
+                _owner: device,
+            }),
+            err => Err(err),
         }
     }
 
-    unsafe fn start_streaming<F, T>(self: &Arc<Self>, width: i32, height: i32, fps: i32, cb: F, init: T) -> Result<UvcStreamHandle, sys::uvc_error> 
+    unsafe fn start_streaming<F, T>(
+        self: &Arc<Self>,
+        width: i32,
+        height: i32,
+        fps: i32,
+        cb: F,
+        init: T,
+    ) -> Result<UvcStreamHandle, sys::uvc_error>
     where
         F: FnMut(UvcFrame, &mut T) + Send + Sync + 'static,
         T: Send + Sync + 'static,
     {
         let mut ctrl = uvc_stream_ctrl_t::default();
         match sys::uvc_get_stream_ctrl_format_size(
-            self.handle.as_ptr(), 
-            &mut ctrl as *mut _, 
-            sys::uvc_frame_format::UVC_FRAME_FORMAT_H264, 
-            width, 
-            height, 
-            fps
+            self.handle.as_ptr(),
+            &mut ctrl as *mut _,
+            sys::uvc_frame_format::UVC_FRAME_FORMAT_H264,
+            width,
+            height,
+            fps,
         ) {
-            sys::uvc_error::UVC_SUCCESS => {},
+            sys::uvc_error::UVC_SUCCESS => {}
             err => return Err(err),
         }
         let (handle, state) = UvcStreamHandle::new(self.clone(), cb, init, ctrl)?;
@@ -194,18 +209,30 @@ impl UvcDeviceHandle {
         }
     }
 
-    pub fn start_streaming<F, T>(self, width: usize, height: usize, fps: usize, cb: F, init: T) -> Result<UvcStreamHandle, sys::uvc_error> 
+    pub fn start_streaming<F, T>(
+        self,
+        width: usize,
+        height: usize,
+        fps: usize,
+        cb: F,
+        init: T,
+    ) -> Result<UvcStreamHandle, sys::uvc_error>
     where
         F: FnMut(UvcFrame, &mut T) + Send + Sync + 'static,
         T: Send + Sync + 'static,
     {
-        unsafe { 
+        unsafe {
             self.inner.start_streaming(
-                width.try_into().map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?, 
-                height.try_into().map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?, 
-                fps.try_into().map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?, 
-                cb, 
-                init
+                width
+                    .try_into()
+                    .map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?,
+                height
+                    .try_into()
+                    .map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?,
+                fps.try_into()
+                    .map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?,
+                cb,
+                init,
             )
         }
     }
@@ -217,7 +244,12 @@ pub struct UvcStreamHandle {
 }
 
 impl UvcStreamHandle {
-    unsafe fn new<F, T>(handle: Arc<UvcDeviceHandleWrapper>, cb: F, init: T, mut ctrl: uvc_stream_ctrl_t) -> Result<(Self, Box<PossibleStream>), sys::uvc_error> 
+    unsafe fn new<F, T>(
+        handle: Arc<UvcDeviceHandleWrapper>,
+        cb: F,
+        init: T,
+        mut ctrl: uvc_stream_ctrl_t,
+    ) -> Result<(Self, Box<PossibleStream>), sys::uvc_error>
     where
         F: FnMut(UvcFrame, &mut T) + Send + Sync + 'static,
         T: Send + Sync + 'static,
@@ -225,28 +257,26 @@ impl UvcStreamHandle {
         let mut state = Box::new(Mutex::new(Some(Box::new((cb, init)) as Box<dyn Stream>)));
 
         match sys::uvc_start_streaming(
-            handle.handle.as_ptr(), 
-            &mut ctrl as *mut _, 
-            Some(callback), 
+            handle.handle.as_ptr(),
+            &mut ctrl as *mut _,
+            Some(callback),
             state.as_mut() as &mut PossibleStream as *mut PossibleStream as *mut _,
-            0
+            0,
         ) {
-            sys::uvc_error::UVC_SUCCESS => {
-                Ok((Self {
+            sys::uvc_error::UVC_SUCCESS => Ok((
+                Self {
                     _handle: handle,
                     ctrl,
-                }, state))
-            },
-            err => Err(err)
+                },
+                state,
+            )),
+            err => Err(err),
         }
     }
 
     pub fn frame_interval(&self) -> Duration {
         Duration::from_nanos(self.ctrl.dwFrameInterval as u64 * 100)
     }
-
-
-
 }
 
 unsafe impl Send for UvcStreamHandle {}
@@ -271,47 +301,38 @@ where
 type PossibleStream = Mutex<Option<Box<dyn Stream>>>;
 
 pub struct UvcFrame {
-    frame: NonNull<sys::uvc_frame>
+    frame: NonNull<sys::uvc_frame>,
 }
 
 impl UvcFrame {
     fn new(frame: NonNull<sys::uvc_frame>) -> Self {
-        Self {
-            frame
-        }
+        Self { frame }
     }
 
     pub fn data(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(self.frame.as_ref().data as *const u8, self.frame.as_ref().data_bytes)
+            std::slice::from_raw_parts(
+                self.frame.as_ref().data as *const u8,
+                self.frame.as_ref().data_bytes,
+            )
         }
     }
 
     pub fn width(&self) -> usize {
-        unsafe {
-            self.frame.as_ref().width as usize
-        }
+        unsafe { self.frame.as_ref().width as usize }
     }
 
     pub fn height(&self) -> usize {
-        unsafe {
-            self.frame.as_ref().height as usize
-        }
+        unsafe { self.frame.as_ref().height as usize }
     }
 
     pub fn step(&self) -> usize {
-        unsafe {
-            self.frame.as_ref().step as usize
-        }
+        unsafe { self.frame.as_ref().step as usize }
     }
 
     pub fn sequence(&self) -> usize {
-        unsafe {
-            self.frame.as_ref().sequence as usize
-        }
+        unsafe { self.frame.as_ref().sequence as usize }
     }
-
-
 }
 
 unsafe impl Send for UvcFrame {}
@@ -319,12 +340,15 @@ unsafe impl Send for UvcFrame {}
 unsafe impl Sync for UvcFrame {}
 
 unsafe extern "C" fn callback(frame: *mut sys::uvc_frame, user_ptr: *mut c_void) {
-    let mut state = (user_ptr as *mut PossibleStream).as_mut().unwrap().lock().unwrap();
+    let mut state = (user_ptr as *mut PossibleStream)
+        .as_mut()
+        .unwrap()
+        .lock()
+        .unwrap();
     if let Some(stream) = state.as_mut() {
         stream.handle_frame(frame);
     }
 }
-
 
 mod sys {
     #![allow(non_upper_case_globals)]
