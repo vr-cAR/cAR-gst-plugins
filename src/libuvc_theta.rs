@@ -9,6 +9,8 @@ use std::{
 
 use self::sys::uvc_stream_ctrl_t;
 
+type PossibleStream = Mutex<(Option<Box<dyn Stream>>, Arc<UvcStreamHandleWrapper>)>;
+
 struct UvcContextWrapper {
     ctx: NonNull<sys::uvc_context>,
 }
@@ -183,9 +185,9 @@ impl UvcDeviceHandleWrapper {
             sys::uvc_error::UVC_SUCCESS => {}
             err => return Err(err),
         }
-        let (handle, state) = UvcStreamHandle::new(self.clone(), cb, init, ctrl)?;
+        let (handle, state) = UvcStreamHandleWrapper::new(self.clone(), cb, init, &mut ctrl)?;
         self.streams.lock().unwrap().push(state);
-        Ok(handle)
+        Ok(UvcStreamHandle::new(handle, ctrl))
     }
 }
 
@@ -238,39 +240,55 @@ impl UvcDeviceHandle {
     }
 }
 
-pub struct UvcStreamHandle {
-    _handle: Arc<UvcDeviceHandleWrapper>,
-    ctrl: uvc_stream_ctrl_t,
+struct UvcStreamHandleWrapper {
+    _owner: Arc<UvcDeviceHandleWrapper>,
 }
 
-impl UvcStreamHandle {
+impl UvcStreamHandleWrapper {
     unsafe fn new<F, T>(
         handle: Arc<UvcDeviceHandleWrapper>,
         cb: F,
         init: T,
-        mut ctrl: uvc_stream_ctrl_t,
-    ) -> Result<(Self, Box<PossibleStream>), sys::uvc_error>
+        ctrl: &mut uvc_stream_ctrl_t,
+    ) -> Result<(Arc<Self>, Box<PossibleStream>), sys::uvc_error>
     where
         F: FnMut(UvcFrame, &mut T) + Send + Sync + 'static,
         T: Send + Sync + 'static,
     {
-        let mut state = Box::new(Mutex::new(Some(Box::new((cb, init)) as Box<dyn Stream>)));
+        let wrapper = Arc::new(Self {
+            _owner: handle,
+        });
+        let mut state: Box<PossibleStream> = Box::new(Mutex::new((Some(Box::new((cb, init)) as Box<dyn Stream>), wrapper.clone())));
 
         match sys::uvc_start_streaming(
-            handle.handle.as_ptr(),
-            &mut ctrl as *mut _,
+            wrapper._owner.handle.as_ptr(),
+            ctrl as *mut _,
             Some(callback),
             state.as_mut() as &mut PossibleStream as *mut PossibleStream as *mut _,
             0,
         ) {
             sys::uvc_error::UVC_SUCCESS => Ok((
-                Self {
-                    _handle: handle,
-                    ctrl,
-                },
+                wrapper,
                 state,
             )),
             err => Err(err),
+        }
+    }
+}
+
+unsafe impl Send for UvcStreamHandleWrapper {}
+unsafe impl Sync for UvcStreamHandleWrapper {}
+
+pub struct UvcStreamHandle {
+    inner: Arc<UvcStreamHandleWrapper>,
+    ctrl: uvc_stream_ctrl_t,
+}
+
+impl UvcStreamHandle {
+    fn new(inner: Arc<UvcStreamHandleWrapper>, ctrl: uvc_stream_ctrl_t) -> Self {
+        Self {
+            inner,
+            ctrl,
         }
     }
 
@@ -279,11 +297,8 @@ impl UvcStreamHandle {
     }
 }
 
-unsafe impl Send for UvcStreamHandle {}
-unsafe impl Sync for UvcStreamHandle {}
-
 trait Stream: Send + Sync {
-    fn handle_frame(&mut self, frame: *mut sys::uvc_frame);
+    fn handle_frame(&mut self, frame: *mut sys::uvc_frame, handle: Arc<UvcStreamHandleWrapper>);
 }
 
 impl<F, T> Stream for (F, T)
@@ -291,22 +306,21 @@ where
     F: FnMut(UvcFrame, &mut T) + Send + Sync,
     T: Send + Sync,
 {
-    fn handle_frame(&mut self, frame: *mut sys::uvc_frame) {
+    fn handle_frame(&mut self, frame: *mut sys::uvc_frame, handle: Arc<UvcStreamHandleWrapper>) {
         let (f, val) = self;
-        let frame = UvcFrame::new(NonNull::new(frame).unwrap());
+        let frame = UvcFrame::new(NonNull::new(frame).unwrap(), handle);
         f(frame, val);
     }
 }
 
-type PossibleStream = Mutex<Option<Box<dyn Stream>>>;
-
 pub struct UvcFrame {
     frame: NonNull<sys::uvc_frame>,
+    _owner: Arc<UvcStreamHandleWrapper>,
 }
 
 impl UvcFrame {
-    fn new(frame: NonNull<sys::uvc_frame>) -> Self {
-        Self { frame }
+    fn new(frame: NonNull<sys::uvc_frame>, handle: Arc<UvcStreamHandleWrapper>) -> Self {
+        Self { frame, _owner: handle }
     }
 
     pub fn data(&self) -> &[u8] {
@@ -345,8 +359,9 @@ unsafe extern "C" fn callback(frame: *mut sys::uvc_frame, user_ptr: *mut c_void)
         .unwrap()
         .lock()
         .unwrap();
+    let (state, stream_handle) = &mut *state;
     if let Some(stream) = state.as_mut() {
-        stream.handle_frame(frame);
+        stream.handle_frame(frame, stream_handle.clone());
     }
 }
 
