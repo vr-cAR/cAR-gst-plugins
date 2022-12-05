@@ -255,10 +255,11 @@ impl UvcStreamHandleWrapper {
         F: FnMut(UvcFrame, &mut T) + Send + Sync + 'static,
         T: Send + Sync + 'static,
     {
-        let wrapper = Arc::new(Self {
-            _owner: handle,
-        });
-        let mut state: Box<PossibleStream> = Box::new(Mutex::new((Some(Box::new((cb, init)) as Box<dyn Stream>), wrapper.clone())));
+        let wrapper = Arc::new(Self { _owner: handle });
+        let mut state: Box<PossibleStream> = Box::new(Mutex::new((
+            Some(Box::new((cb, init)) as Box<dyn Stream>),
+            wrapper.clone(),
+        )));
 
         match sys::uvc_start_streaming(
             wrapper._owner.handle.as_ptr(),
@@ -267,10 +268,7 @@ impl UvcStreamHandleWrapper {
             state.as_mut() as &mut PossibleStream as *mut PossibleStream as *mut _,
             0,
         ) {
-            sys::uvc_error::UVC_SUCCESS => Ok((
-                wrapper,
-                state,
-            )),
+            sys::uvc_error::UVC_SUCCESS => Ok((wrapper, state)),
             err => Err(err),
         }
     }
@@ -286,10 +284,7 @@ pub struct UvcStreamHandle {
 
 impl UvcStreamHandle {
     fn new(inner: Arc<UvcStreamHandleWrapper>, ctrl: uvc_stream_ctrl_t) -> Self {
-        Self {
-            inner,
-            ctrl,
-        }
+        Self { inner, ctrl }
     }
 
     pub fn frame_interval(&self) -> Duration {
@@ -320,7 +315,10 @@ pub struct UvcFrame {
 
 impl UvcFrame {
     fn new(frame: NonNull<sys::uvc_frame>, handle: Arc<UvcStreamHandleWrapper>) -> Self {
-        Self { frame, _owner: handle }
+        Self {
+            frame,
+            _owner: handle,
+        }
     }
 
     pub fn data(&self) -> &[u8] {
@@ -346,6 +344,31 @@ impl UvcFrame {
 
     pub fn sequence(&self) -> usize {
         unsafe { self.frame.as_ref().sequence as usize }
+    }
+
+    pub fn start_timestamp(&self) -> Duration {
+        unsafe {
+            Duration::new(
+                self.frame.as_ref().capture_time.tv_sec as u64,
+                self.frame.as_ref().capture_time.tv_usec.try_into().unwrap(),
+            )
+        }
+    }
+
+    pub fn finish_timestamp(&self) -> Duration {
+        unsafe {
+            Duration::new(
+                self.frame.as_ref().capture_time_finished.tv_sec as u64,
+                self.frame
+                    .as_ref()
+                    .capture_time_finished
+                    .tv_nsec
+                    .try_into()
+                    .unwrap(),
+            )
+            .try_into()
+            .unwrap()
+        }
     }
 }
 
