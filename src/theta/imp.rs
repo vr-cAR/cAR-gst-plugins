@@ -1,5 +1,4 @@
-use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex, RwLock, Weak};
+use std::sync::{RwLock, Weak};
 use std::time::Duration;
 use std::{str::FromStr, sync::Arc};
 
@@ -10,7 +9,10 @@ use gstreamer_base::{prelude::*, subclass::base_src::CreateSuccess};
 use once_cell::sync::Lazy;
 use strum_macros::{EnumString, IntoStaticStr};
 
-use crate::libuvc_theta::{UvcContext, UvcDevice, UvcFrame, UvcStreamHandle};
+use crate::{
+    frame::FrameData,
+    theta::libuvc_theta::{UvcContext, UvcDevice, UvcFrame, UvcStreamHandle},
+};
 
 static CAT: Lazy<gstreamer::DebugCategory> = Lazy::new(|| {
     gstreamer::DebugCategory::new(
@@ -23,8 +25,6 @@ static CAT: Lazy<gstreamer::DebugCategory> = Lazy::new(|| {
 const USBVID_RICOH: u16 = 0x05ca;
 const USBPID_THETAV_UVC: u16 = 0x2712;
 const USBPID_THETAZ1_UVC: u16 = 0x2715;
-
-const BUFFER_SZ: usize = 1;
 
 #[derive(Debug, Clone)]
 struct Settings {
@@ -85,24 +85,10 @@ impl Default for State {
     }
 }
 
-struct Frames {
-    buffer: VecDeque<gstreamer::Buffer>,
-    start_timestamp: Option<Duration>,
-}
-
-impl Default for Frames {
-    fn default() -> Self {
-        Self {
-            buffer: VecDeque::new(),
-            start_timestamp: None,
-        }
-    }
-}
-
 pub struct ThetaUvc {
     settings: RwLock<Settings>,
     state: RwLock<State>,
-    frames: Arc<(Mutex<Frames>, Condvar)>,
+    frame_data: RwLock<Option<Arc<FrameData<gstreamer::Buffer>>>>,
 }
 
 #[glib::object_subclass]
@@ -117,7 +103,7 @@ impl ObjectSubclass for ThetaUvc {
         Self {
             settings: RwLock::new(Settings::default()),
             state: RwLock::new(State::default()),
-            frames: Arc::new((Mutex::new(Frames::default()), Condvar::new())),
+            frame_data: RwLock::new(None),
         }
     }
 }
@@ -419,8 +405,18 @@ impl BaseSrcImpl for ThetaUvc {
 
     fn start(&self) -> Result<(), gstreamer::ErrorMessage> {
         let settings = {
+            // settings span
             let settings = self.settings.read().unwrap();
             settings.clone()
+        };
+
+        let frame_data = {
+            // frame data span
+            let mut frame_data = self.frame_data.write().unwrap();
+            let fd = Arc::new(FrameData::default());
+            let weak = Arc::downgrade(&fd);
+            frame_data.replace(fd);
+            weak
         };
 
         let mut state = self.state.write().unwrap();
@@ -449,7 +445,7 @@ impl BaseSrcImpl for ThetaUvc {
                 settings.height as usize,
                 settings.fps as usize,
                 on_frame_callback,
-                Arc::downgrade(&self.frames.clone()),
+                frame_data,
             )
             .map_err(|err| {
                 gstreamer::error_msg!(
@@ -468,10 +464,7 @@ impl BaseSrcImpl for ThetaUvc {
             state.device.take();
         }
         {
-            let (frames, _) = &*self.frames;
-            let mut frames = frames.lock().unwrap();
-            frames.buffer.clear();
-            frames.start_timestamp.take();
+            self.frame_data.write().unwrap().take();
         }
         Ok(())
     }
@@ -481,21 +474,23 @@ impl BaseSrcImpl for ThetaUvc {
             gstreamer::QueryViewMut::Latency(latency) => {
                 latency.set(
                     true,
-                    self.state.read().unwrap().stream.as_ref().map_or_else(
-                        || {
-                            gstreamer::ClockTime::from_nseconds(
-                                Duration::from_secs_f64(
-                                    (self.settings.read().unwrap().fps * 1000) as f64 / 1001f64,
+                    self.frame_data
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .map(|fd| fd.get_latency())
+                        .flatten()
+                        .map_or_else(
+                            || {
+                                gstreamer::ClockTime::from_nseconds(
+                                    Duration::from_secs_f64(
+                                        (self.settings.read().unwrap().fps * 1000) as f64 / 1001f64,
+                                    )
+                                    .as_nanos() as u64,
                                 )
-                                .as_nanos() as u64,
-                            )
-                        },
-                        |stream| {
-                            gstreamer::ClockTime::from_nseconds(
-                                stream.frame_interval().as_nanos().try_into().unwrap(),
-                            )
-                        },
-                    ),
+                            },
+                            |stream| gstreamer::ClockTime::from_nseconds(stream.as_nanos() as u64),
+                        ),
                     None,
                 );
                 true
@@ -514,10 +509,9 @@ impl PushSrcImpl for ThetaUvc {
         &self,
         _buffer: Option<&mut gstreamer::BufferRef>,
     ) -> Result<CreateSuccess, gstreamer::FlowError> {
-        let (frames, cv) = &*self.frames;
-        let mut frames = frames.lock().unwrap();
-        loop {
-            if let Some(buffer) = frames.buffer.pop_front() {
+        let mut frame_data = self.frame_data.read().unwrap();
+        while let Some(fd) = frame_data.as_ref() {
+            if let Some(buffer) = fd.pop_frame() {
                 gstreamer::debug!(
                     CAT,
                     imp: self,
@@ -529,8 +523,13 @@ impl PushSrcImpl for ThetaUvc {
                 return Ok(CreateSuccess::NewBuffer(buffer));
             }
             gstreamer::debug!(CAT, imp: self, "Sleeping until next frame");
-            frames = cv.wait(frames).unwrap();
+            let fd = fd.clone();
+            std::mem::drop(frame_data); // let another person use lock
+            fd.wait();
+            gstreamer::debug!(CAT, imp: self, "Woke up");
+            frame_data = self.frame_data.read().unwrap();
         }
+        Err(gstreamer::FlowError::Eos)
     }
 }
 
@@ -567,8 +566,8 @@ impl Mode {
     }
 }
 
-fn on_frame_callback(frame: UvcFrame, state: &mut Weak<(Mutex<Frames>, Condvar)>) {
-    let Some(frames) = state.upgrade() else {
+fn on_frame_callback(frame: UvcFrame, state: &mut Weak<FrameData<gstreamer::Buffer>>) {
+    let Some(frame_data) = state.upgrade() else {
         return;
     };
     gstreamer::debug!(CAT, "Creating buffer for frame");
@@ -580,37 +579,32 @@ fn on_frame_callback(frame: UvcFrame, state: &mut Weak<(Mutex<Frames>, Condvar)>
         .as_mut_slice()
         .copy_from_slice(frame.data());
 
-    let (frames, cv) = &*frames;
-    let mut frames = frames.lock().unwrap();
-    if frames.start_timestamp.is_none() {
-        frames.start_timestamp.replace(frame.start_timestamp());
-    }
-    let Some(start_timestamp) = frames.start_timestamp.as_ref() else {
-        unreachable!()
-    };
-    let pts = frame
-        .start_timestamp()
-        .saturating_sub(start_timestamp.clone());
-    let duration = frame
-        .finish_timestamp()
-        .saturating_sub(frame.start_timestamp());
+    let span = {
+        let start_timestamp = frame_data.start_timestamp(frame.start_timestamp());
+        let pts = frame
+            .start_timestamp()
+            .saturating_sub(start_timestamp.clone());
+        let duration = frame
+            .finish_timestamp()
+            .saturating_sub(frame.start_timestamp());
 
-    buffer
-        .make_mut()
-        .set_pts(Some(gstreamer::ClockTime::from_nseconds(
-            pts.as_nanos().try_into().unwrap(),
-        )));
-    buffer.make_mut().set_dts(None);
-    buffer
-        .make_mut()
-        .set_duration(Some(gstreamer::ClockTime::from_nseconds(
-            duration.as_nanos().try_into().unwrap(),
-        )));
-    buffer.make_mut().set_offset(frame.sequence() as u64);
-    if frames.buffer.len() < BUFFER_SZ {
-        frames.buffer.push_back(buffer);
-    }
-    cv.notify_one();
+        buffer
+            .make_mut()
+            .set_pts(Some(gstreamer::ClockTime::from_nseconds(
+                pts.as_nanos().try_into().unwrap(),
+            )));
+        buffer.make_mut().set_dts(None);
+        buffer
+            .make_mut()
+            .set_duration(Some(gstreamer::ClockTime::from_nseconds(
+                duration.as_nanos().try_into().unwrap(),
+            )));
+        buffer.make_mut().set_offset(frame.sequence() as u64);
+        frame_data.add_frame(buffer);
+        duration
+    };
+
+    frame_data.update_latency(span);
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy, glib::Enum)]

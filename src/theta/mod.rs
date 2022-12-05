@@ -1,4 +1,5 @@
 mod imp;
+mod libuvc_theta;
 use std::error::Error;
 
 use gstreamer::{glib, prelude::StaticType};

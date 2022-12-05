@@ -1,4 +1,4 @@
-mod libuvc_theta;
+mod frame;
 mod theta;
 use std::error::Error;
 
