@@ -487,14 +487,21 @@ impl BaseSrcImpl for ThetaUvc {
                             || {
                                 gstreamer::ClockTime::from_nseconds(
                                     Duration::from_secs_f64(
-                                        (self.settings.read().unwrap().fps * 1000) as f64 / 1001f64,
+                                        1001f64 / (self.settings.read().unwrap().fps * 1000) as f64,
                                     )
                                     .as_nanos() as u64,
                                 )
                             },
-                            |stream| gstreamer::ClockTime::from_nseconds(stream.as_nanos() as u64),
+                            |stream| {
+                                gstreamer::info!(
+                                    CAT,
+                                    imp: self,
+                                    "Responding to query with live latency"
+                                );
+                                gstreamer::ClockTime::from_nseconds(stream.as_nanos() as u64)
+                            },
                         ),
-                    None,
+                    Some(gstreamer::ClockTime::from_mseconds(100)),
                 );
                 true
             }
