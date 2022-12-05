@@ -9,6 +9,7 @@ use gstreamer_base::{prelude::*, subclass::base_src::CreateSuccess};
 use once_cell::sync::Lazy;
 use strum_macros::{EnumString, IntoStaticStr};
 
+use crate::theta::libuvc_theta::StreamParameters;
 use crate::{
     frame::FrameData,
     theta::libuvc_theta::{UvcContext, UvcDevice, UvcFrame, UvcStreamHandle},
@@ -441,9 +442,11 @@ impl BaseSrcImpl for ThetaUvc {
 
         let stream_handle = device_handle
             .start_streaming(
-                settings.width as usize,
-                settings.height as usize,
-                settings.fps as usize,
+                StreamParameters {
+                    width: settings.width as usize,
+                    height: settings.height as usize,
+                    fps: settings.fps as usize,
+                },
                 on_frame_callback,
                 frame_data,
             )
@@ -566,8 +569,12 @@ impl Mode {
     }
 }
 
-fn on_frame_callback(frame: UvcFrame, state: &mut Weak<FrameData<gstreamer::Buffer>>) {
-    let Some(frame_data) = state.upgrade() else {
+fn on_frame_callback(
+    frame: UvcFrame,
+    frame_data: &mut Weak<FrameData<gstreamer::Buffer>>,
+    stream_handle: &UvcStreamHandle,
+) {
+    let Some(frame_data) = frame_data.upgrade() else {
         return;
     };
     gstreamer::debug!(CAT, "Creating buffer for frame");
@@ -580,13 +587,9 @@ fn on_frame_callback(frame: UvcFrame, state: &mut Weak<FrameData<gstreamer::Buff
         .copy_from_slice(frame.data());
 
     let span = {
-        let start_timestamp = frame_data.start_timestamp(frame.start_timestamp());
-        let pts = frame
-            .start_timestamp()
-            .saturating_sub(start_timestamp.clone());
-        let duration = frame
-            .finish_timestamp()
-            .saturating_sub(frame.start_timestamp());
+        let start_timestamp = frame_data.start_timestamp(frame.finish_timestamp());
+        let pts = frame.finish_timestamp().saturating_sub(start_timestamp);
+        let duration = stream_handle.frame_interval();
 
         buffer
             .make_mut()

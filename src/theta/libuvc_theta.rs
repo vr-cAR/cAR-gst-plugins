@@ -142,6 +142,12 @@ impl UvcDevice {
     }
 }
 
+pub struct StreamParameters {
+    pub width: usize,
+    pub height: usize,
+    pub fps: usize,
+}
+
 struct UvcDeviceHandleWrapper {
     handle: NonNull<sys::uvc_device_handle>,
     streams: Mutex<Vec<Box<PossibleStream>>>,
@@ -170,7 +176,7 @@ impl UvcDeviceHandleWrapper {
         init: T,
     ) -> Result<UvcStreamHandle, sys::uvc_error>
     where
-        F: FnMut(UvcFrame, &mut T) + Send + Sync + 'static,
+        F: FnMut(UvcFrame, &mut T, &UvcStreamHandle) + Send + Sync + 'static,
         T: Send + Sync + 'static,
     {
         let mut ctrl = uvc_stream_ctrl_t::default();
@@ -187,7 +193,7 @@ impl UvcDeviceHandleWrapper {
         }
         let (handle, state) = UvcStreamHandleWrapper::new(self.clone(), cb, init, &mut ctrl)?;
         self.streams.lock().unwrap().push(state);
-        Ok(UvcStreamHandle::new(handle, ctrl))
+        Ok(UvcStreamHandle::new(handle))
     }
 }
 
@@ -213,25 +219,27 @@ impl UvcDeviceHandle {
 
     pub fn start_streaming<F, T>(
         self,
-        width: usize,
-        height: usize,
-        fps: usize,
+        params: StreamParameters,
         cb: F,
         init: T,
     ) -> Result<UvcStreamHandle, sys::uvc_error>
     where
-        F: FnMut(UvcFrame, &mut T) + Send + Sync + 'static,
+        F: FnMut(UvcFrame, &mut T, &UvcStreamHandle) + Send + Sync + 'static,
         T: Send + Sync + 'static,
     {
         unsafe {
             self.inner.start_streaming(
-                width
+                params
+                    .width
                     .try_into()
                     .map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?,
-                height
+                params
+                    .height
                     .try_into()
                     .map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?,
-                fps.try_into()
+                params
+                    .fps
+                    .try_into()
                     .map_err(|_err| sys::uvc_error::UVC_ERROR_NOT_SUPPORTED)?,
                 cb,
                 init,
@@ -242,6 +250,7 @@ impl UvcDeviceHandle {
 
 struct UvcStreamHandleWrapper {
     _owner: Arc<UvcDeviceHandleWrapper>,
+    ctrl: uvc_stream_ctrl_t,
 }
 
 impl UvcStreamHandleWrapper {
@@ -252,10 +261,13 @@ impl UvcStreamHandleWrapper {
         ctrl: &mut uvc_stream_ctrl_t,
     ) -> Result<(Arc<Self>, Box<PossibleStream>), sys::uvc_error>
     where
-        F: FnMut(UvcFrame, &mut T) + Send + Sync + 'static,
+        F: FnMut(UvcFrame, &mut T, &UvcStreamHandle) + Send + Sync + 'static,
         T: Send + Sync + 'static,
     {
-        let wrapper = Arc::new(Self { _owner: handle });
+        let wrapper = Arc::new(Self {
+            _owner: handle,
+            ctrl: ctrl.clone(),
+        });
         let mut state: Box<PossibleStream> = Box::new(Mutex::new((
             Some(Box::new((cb, init)) as Box<dyn Stream>),
             wrapper.clone(),
@@ -279,20 +291,16 @@ unsafe impl Sync for UvcStreamHandleWrapper {}
 
 pub struct UvcStreamHandle {
     _inner: Arc<UvcStreamHandleWrapper>,
-    ctrl: uvc_stream_ctrl_t,
 }
 
 impl UvcStreamHandle {
-    fn new(inner: Arc<UvcStreamHandleWrapper>, ctrl: uvc_stream_ctrl_t) -> Self {
-        Self {
-            _inner: inner,
-            ctrl,
-        }
+    fn new(inner: Arc<UvcStreamHandleWrapper>) -> Self {
+        Self { _inner: inner }
     }
 
     #[allow(unused)]
     pub fn frame_interval(&self) -> Duration {
-        Duration::from_nanos(self.ctrl.dwFrameInterval as u64 * 100)
+        Duration::from_nanos(self._inner.ctrl.dwFrameInterval as u64 * 100)
     }
 }
 
@@ -302,13 +310,13 @@ trait Stream: Send + Sync {
 
 impl<F, T> Stream for (F, T)
 where
-    F: FnMut(UvcFrame, &mut T) + Send + Sync,
+    F: FnMut(UvcFrame, &mut T, &UvcStreamHandle) + Send + Sync,
     T: Send + Sync,
 {
     fn handle_frame(&mut self, frame: *mut sys::uvc_frame, handle: Arc<UvcStreamHandleWrapper>) {
         let (f, val) = self;
-        let frame = UvcFrame::new(NonNull::new(frame).unwrap(), handle);
-        f(frame, val);
+        let frame = UvcFrame::new(NonNull::new(frame).unwrap(), handle.clone());
+        f(frame, val, &UvcStreamHandle::new(handle));
     }
 }
 

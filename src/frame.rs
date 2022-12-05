@@ -16,6 +16,7 @@ impl<T> FrameData<T> {
     const BUFFER_SZ: usize = 1;
     const EXP_MOVING_AVG_COEF: f64 = 0.8f64;
 
+    #[allow(unused)]
     pub fn start_timestamp(&self, current_timestamp: Duration) -> Duration {
         match self
             .start_timestamp
