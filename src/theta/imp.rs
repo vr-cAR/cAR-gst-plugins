@@ -7,13 +7,14 @@ use gstreamer::{glib, prelude::*};
 use gstreamer_base::subclass::prelude::*;
 use gstreamer_base::{prelude::*, subclass::base_src::CreateSuccess};
 use once_cell::sync::Lazy;
-use strum_macros::{EnumString, IntoStaticStr};
+use strum::IntoEnumIterator;
+use strum_macros::{EnumIter, EnumString, IntoStaticStr};
 
-use crate::theta::libuvc_theta::StreamParameters;
 use crate::{
     frame::FrameData,
     theta::libuvc_theta::{UvcContext, UvcDevice, UvcFrame, UvcStreamHandle},
 };
+use crate::{macros::set_field, theta::libuvc_theta::StreamParameters};
 
 static CAT: Lazy<gstreamer::DebugCategory> = Lazy::new(|| {
     gstreamer::DebugCategory::new(
@@ -60,7 +61,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, EnumString, IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, EnumString, EnumIter, IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 enum SettingField {
     Width,
@@ -92,6 +93,16 @@ pub struct ThetaUvc {
     frame_data: RwLock<Option<Arc<FrameData<gstreamer::Buffer>>>>,
 }
 
+impl ThetaUvc {
+    fn camera_caps() -> gstreamer::Caps {
+        gstreamer::Caps::builder("video/x-h264")
+            .field("stream-format", "byte-stream")
+            .field("profile", "constrained-baseline")
+            .field("alignment", "nal")
+            .build()
+    }
+}
+
 #[glib::object_subclass]
 impl ObjectSubclass for ThetaUvc {
     const NAME: &'static str = "thetauvcsrc";
@@ -112,36 +123,52 @@ impl ObjectSubclass for ThetaUvc {
 impl ObjectImpl for ThetaUvc {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
-            vec![
-                glib::ParamSpecUInt::builder(SettingField::Width.into())
-                    .nick("Camera Width")
-                    .blurb("The width of the camera stream")
-                    .build(),
-                glib::ParamSpecUInt::builder(SettingField::Height.into())
-                    .nick("Camera Height")
-                    .blurb("The height of the camera stream")
-                    .build(),
-                glib::ParamSpecUInt::builder(SettingField::Fps.into())
-                    .nick("Camera FPS")
-                    .blurb("The FPS to read from the camera")
-                    .build(),
-                glib::ParamSpecEnum::builder(SettingField::Mode.into(), Mode::NoMode)
-                    .nick("Stream Mode Presets")
-                    .blurb("Which preset to use for streaming")
-                    .build(),
-                glib::ParamSpecEnum::builder(SettingField::Product.into(), Product::AnyProduct)
-                    .nick("Ricoh Theta Product")
-                    .blurb("The product type of the camera")
-                    .build(),
-                glib::ParamSpecString::builder(SettingField::SerialNumber.into())
-                    .nick("Device Serial Number")
-                    .blurb("The serial number of the device")
-                    .build(),
-                glib::ParamSpecUInt::builder(SettingField::DeviceIndex.into())
-                    .nick("Device Index")
-                    .blurb("Given a list of devices that matches the capabilities of the desired device, chooses which one to use")
-                    .build(),
-            ]
+            SettingField::iter().map(|setting| {
+                match setting {
+                    SettingField::Width => {
+                        glib::ParamSpecUInt::builder(SettingField::Width.into())
+                            .nick("Camera Width")
+                            .blurb("The width of the camera stream")
+                            .build()
+                    },
+                    SettingField::Height => {
+                        glib::ParamSpecUInt::builder(SettingField::Height.into())
+                            .nick("Camera Height")
+                            .blurb("The height of the camera stream")
+                            .build()
+                    },
+                    SettingField::Fps => {
+                        glib::ParamSpecUInt::builder(SettingField::Fps.into())
+                            .nick("Camera FPS")
+                            .blurb("The FPS to read from the camera")
+                            .build()
+                    },
+                    SettingField::Mode => {
+                        glib::ParamSpecEnum::builder(SettingField::Mode.into(), Settings::default().mode)
+                            .nick("Stream Mode Presets")
+                            .blurb("Which preset to use for streaming")
+                            .build()
+                    },
+                    SettingField::Product => {
+                        glib::ParamSpecEnum::builder(SettingField::Product.into(), Settings::default().product)
+                            .nick("Ricoh Theta Product")
+                            .blurb("The product type of the camera")
+                            .build()
+                    },
+                    SettingField::SerialNumber => {
+                        glib::ParamSpecString::builder(SettingField::SerialNumber.into())
+                            .nick("Device Serial Number")
+                            .blurb("The serial number of the device")
+                            .build()
+                    },
+                    SettingField::DeviceIndex => {
+                        glib::ParamSpecUInt::builder(SettingField::DeviceIndex.into())
+                            .nick("Device Index")
+                            .blurb("Given a list of devices that matches the capabilities of the desired device, chooses which one to use")
+                            .build()
+                    },
+                }
+            }).collect()
         });
         PROPERTIES.as_ref()
     }
@@ -149,7 +176,6 @@ impl ObjectImpl for ThetaUvc {
     fn constructed(&self) {
         self.parent_constructed();
         let obj = self.instance();
-        // obj.set_live(true);
         obj.set_format(gstreamer::Format::Time);
     }
 
@@ -157,78 +183,40 @@ impl ObjectImpl for ThetaUvc {
         match SettingField::from_str(pspec.name()) {
             Ok(field) => {
                 let mut settings = self.settings.write().unwrap();
-                macro_rules! set_field {
-                    ($field:expr, $val: expr) => {
-                        {
-                            gstreamer::debug!(
-                                CAT,
-                                imp: self,
-                                "Changing {} from {} to {}",
-                                Into::<&str>::into(field),
-                                $field,
-                                $val,
-                            );
-                            $field = $val;
-                        }
-                    };
-                    ($field:expr) => {
-                        {
-                            let Ok(new_value) = value.get() else {
-                                panic!("Could not deserialize value passed in for {}", Into::<&str>::into(field));
-                            };
-                            set_field!($field, new_value);
-                        }
-                    };
-                    (enum $field:expr, $val:expr) => {
-                        {
-                            gstreamer::debug!(
-                                CAT,
-                                imp: self,
-                                "Changing {} from {} to {}",
-                                Into::<&str>::into(field),
-                                glib::EnumValue::from_value(&$field.to_value()).unwrap().1.name(),
-                                glib::EnumValue::from_value(&value).unwrap().1.name(),
-                            );
-                            $field = $val;
-                        }
-                    };
-                    (enum $field:expr) => {
-                        {
-                            let Ok(new_value) = value.get() else {
-                                panic!("Could not deserialize value passed in for {}", Into::<&str>::into(field));
-                            };
-                            set_field!(enum $field, new_value);
-                        }
-                    }
-                }
-                Mode::Fhd.to_value();
                 match field {
                     SettingField::Width => {
-                        set_field!(settings.width);
-                        set_field!(enum settings.mode, Mode::NoMode);
+                        set_field!(CAT, self, field, settings.width, value);
+                        set_field!(CAT, self, field, enum settings.mode, (Mode::NoMode));
                     }
                     SettingField::Height => {
-                        set_field!(settings.height);
-                        set_field!(enum settings.mode, Mode::NoMode);
+                        set_field!(CAT, self, field, settings.height, value);
+                        set_field!(CAT, self, field, enum settings.mode, (Mode::NoMode));
                     }
                     SettingField::Fps => {
-                        set_field!(settings.fps);
-                        set_field!(enum settings.mode, Mode::NoMode);
+                        set_field!(CAT, self, field, settings.fps, value);
+                        set_field!(CAT, self, field, enum settings.mode, (Mode::NoMode));
                     }
                     SettingField::Mode => {
-                        set_field!(enum settings.mode);
+                        set_field!(CAT, self, field, enum settings.mode, value);
                         if let Some(preset) = settings.mode.get_mode_settings() {
-                            set_field!(settings.width, preset.width);
-                            set_field!(settings.height, preset.height);
-                            set_field!(settings.fps, preset.fps);
+                            set_field!(CAT, self, field, settings.width, (preset.width));
+                            set_field!(CAT, self, field, settings.height, (preset.height));
+                            set_field!(CAT, self, field, settings.fps, (preset.fps));
                         }
                     }
-                    SettingField::Product => set_field!(enum settings.product),
-                    SettingField::DeviceIndex => set_field!(settings.device_index),
-                    SettingField::SerialNumber => set_field!(settings.serial_number),
+                    SettingField::Product => {
+                        set_field!(CAT, self, field, enum settings.product, value)
+                    }
+                    SettingField::DeviceIndex => {
+                        set_field!(CAT, self, field, settings.device_index, value)
+                    }
+                    SettingField::SerialNumber => {
+                        set_field!(CAT, self, field, settings.serial_number, value)
+                    }
                 };
             }
             Err(_err) => {
+                gstreamer::error!(CAT, imp: self, "Unknown field {}", pspec.name());
                 panic!("Unknown field {}", pspec.name());
             }
         }
@@ -277,11 +265,7 @@ impl ElementImpl for ThetaUvc {
                 "src",
                 gstreamer::PadDirection::Src,
                 gstreamer::PadPresence::Always,
-                &gstreamer::Caps::builder("video/x-h264")
-                    .field("stream-format", "byte-stream")
-                    .field("profile", "constrained-baseline")
-                    .field("alignment", "nal")
-                    .build(),
+                &ThetaUvc::camera_caps(),
             )
             .unwrap();
             vec![src_pad_template]
@@ -383,19 +367,10 @@ impl BaseSrcImpl for ThetaUvc {
     }
 
     fn caps(&self, filter: Option<&gstreamer::Caps>) -> Option<gstreamer::Caps> {
-        let settings = self.settings.read().unwrap();
-        let caps = gstreamer::Caps::builder("video/x-h264")
-            .field(
-                "framerate",
-                gstreamer::Fraction::new((settings.fps * 1000) as i32, 1001),
-            )
-            .field("stream-format", "byte-stream")
-            .field("profile", "constrained-baseline")
-            .field("alignment", "nal")
-            .build();
+        let caps = Self::camera_caps();
         if let Some(filter) = filter {
             if filter.can_intersect(&caps) {
-                Some(caps)
+                Some(caps.intersect(filter))
             } else {
                 None
             }
@@ -429,7 +404,7 @@ impl BaseSrcImpl for ThetaUvc {
         })?;
         let device_handle = device
             .open()
-            .map_err(|err| gstreamer::error_msg!(gstreamer::LibraryError::Init, ("{:#?}", err)))?;
+            .map_err(|err| gstreamer::error_msg!(gstreamer::CoreError::Failed, ("{:#?}", err)))?;
 
         gstreamer::info!(
             CAT,
@@ -464,7 +439,7 @@ impl BaseSrcImpl for ThetaUvc {
     fn stop(&self) -> Result<(), gstreamer::ErrorMessage> {
         {
             let mut state = self.state.write().unwrap();
-            state.device.take();
+            state.stream.take();
         }
         {
             self.frame_data.write().unwrap().take();
@@ -481,8 +456,7 @@ impl BaseSrcImpl for ThetaUvc {
                         .read()
                         .unwrap()
                         .as_ref()
-                        .map(|fd| fd.get_latency())
-                        .flatten()
+                        .and_then(|fd| fd.get_latency())
                         .map_or_else(
                             || {
                                 gstreamer::ClockTime::from_nseconds(
@@ -506,7 +480,7 @@ impl BaseSrcImpl for ThetaUvc {
                 true
             }
             gstreamer::QueryViewMut::Caps(caps) => {
-                caps.set_result(self.caps(None).as_ref());
+                caps.set_result(&self.caps(caps.filter().map(|r| r.to_owned()).as_ref()));
                 true
             }
             _ => BaseSrcImplExt::parent_query(self, query),
@@ -585,13 +559,15 @@ fn on_frame_callback(
         return;
     };
     gstreamer::debug!(CAT, "Creating buffer for frame");
-    let mut buffer = gstreamer::Buffer::with_size(frame.data().len()).unwrap();
-    buffer
-        .make_mut()
-        .map_writable()
-        .unwrap()
-        .as_mut_slice()
-        .copy_from_slice(frame.data());
+    let Ok(mut buffer) = gstreamer::Buffer::with_size(frame.data().len()) else {
+        return;
+    };
+    {
+        let Ok(mut mapped_writable) = buffer.make_mut().map_writable() else {
+            return;
+        };
+        mapped_writable.as_mut_slice().copy_from_slice(frame.data());
+    }
 
     let span = {
         let start_timestamp = frame_data.start_timestamp(frame.finish_timestamp());

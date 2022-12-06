@@ -266,7 +266,7 @@ impl UvcStreamHandleWrapper {
     {
         let wrapper = Arc::new(Self {
             _owner: handle,
-            ctrl: ctrl.clone(),
+            ctrl: *ctrl,
         });
         let mut state: Box<PossibleStream> = Box::new(Mutex::new((
             Some(Box::new((cb, init)) as Box<dyn Stream>),
@@ -400,8 +400,8 @@ unsafe impl Send for UvcFrame {}
 unsafe impl Sync for UvcFrame {}
 
 unsafe extern "C" fn callback(frame: *mut sys::uvc_frame, user_ptr: *mut c_void) {
-    let mut state = (user_ptr as *mut PossibleStream)
-        .as_mut()
+    let mut state = (user_ptr as *const PossibleStream)
+        .as_ref()
         .unwrap()
         .lock()
         .unwrap();
@@ -417,5 +417,5 @@ mod sys {
     #![allow(non_snake_case)]
     #![allow(dead_code)]
 
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+    include!(concat!(env!("OUT_DIR"), "/theta.rs"));
 }

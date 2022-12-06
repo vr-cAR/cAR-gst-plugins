@@ -1,5 +1,5 @@
 use std::{
-    sync::{Condvar, Mutex},
+    sync::{atomic::AtomicUsize, Condvar, Mutex},
     time::Duration,
 };
 
@@ -10,6 +10,7 @@ pub struct FrameData<T> {
     start_timestamp: AtomicCell<Option<Duration>>,
     latency: AtomicCell<Option<f64>>,
     park: (Mutex<()>, Condvar),
+    frame_counter: AtomicUsize,
 }
 
 impl<T> FrameData<T> {
@@ -17,12 +18,9 @@ impl<T> FrameData<T> {
     const EXP_MOVING_AVG_COEF: f64 = 0.8f64;
 
     #[allow(unused)]
-    pub fn start_timestamp(&self, current_timestamp: Duration) -> Duration {
-        match self
-            .start_timestamp
-            .compare_exchange(None, Some(current_timestamp))
-        {
-            Ok(None) => current_timestamp,
+    pub fn start_timestamp(&self, timestamp: Duration) -> Duration {
+        match self.start_timestamp.compare_exchange(None, Some(timestamp)) {
+            Ok(None) => timestamp,
             Err(Some(prev)) => prev,
             _ => unreachable!(),
         }
@@ -41,14 +39,16 @@ impl<T> FrameData<T> {
 
     pub fn get_latency(&self) -> Option<Duration> {
         self.latency
-            .take()
+            .load()
             .map(|timestamp| Duration::from_nanos(timestamp as u64))
     }
 
-    pub fn add_frame(&self, frame: T) {
+    pub fn add_frame(&self, frame: T) -> usize {
         self.buffer.force_push(frame);
         let (_lock, cv) = &self.park;
         cv.notify_one();
+        self.frame_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn pop_frame(&self) -> Option<T> {
@@ -68,6 +68,7 @@ impl<T> Default for FrameData<T> {
             start_timestamp: AtomicCell::new(None),
             park: (Mutex::new(()), Condvar::new()),
             latency: AtomicCell::new(None),
+            frame_counter: AtomicUsize::new(0),
         }
     }
 }

@@ -1,5 +1,10 @@
 mod frame;
+#[cfg(feature = "k4a")]
+mod k4a;
+mod macros;
+#[cfg(feature = "theta")]
 mod theta;
+
 use std::error::Error;
 
 use gstreamer::{self, plugin_define};
@@ -17,6 +22,9 @@ plugin_define!(
 );
 
 fn plugin_init(plugin: &gstreamer::Plugin) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "theta")]
     theta::register(plugin)?;
+    #[cfg(feature = "k4a")]
+    k4a::register(plugin)?;
     Ok(())
 }
