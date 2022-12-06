@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::{str::FromStr, sync::RwLock, time::Duration};
 
 use gstreamer::{glib, prelude::*, subclass::prelude::*, Caps};
@@ -84,7 +85,7 @@ impl Default for State {
 pub struct K4a {
     settings: RwLock<Settings>,
     state: RwLock<State>,
-    frame_data: FrameData<()>,
+    frame_data: Arc<FrameData<()>>,
 }
 
 impl K4a {
@@ -127,7 +128,7 @@ impl ObjectSubclass for K4a {
         Self {
             settings: RwLock::new(Settings::default()),
             state: RwLock::new(State::default()),
-            frame_data: FrameData::default(),
+            frame_data: Arc::new(FrameData::default()),
         }
     }
 }

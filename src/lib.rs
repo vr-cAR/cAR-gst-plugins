@@ -11,7 +11,7 @@ use gstreamer::{self, plugin_define};
 
 plugin_define!(
     c_ar_gst_plugins,
-    "Ricoh Theta gstreamer video source",
+    "Video sources for cAR cameras",
     plugin_init,
     "0.1.0",
     "BSD",

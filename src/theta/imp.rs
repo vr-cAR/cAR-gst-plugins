@@ -402,9 +402,12 @@ impl BaseSrcImpl for ThetaUvc {
                 ["device not initialized yet"]
             )
         })?;
-        let device_handle = device
-            .open()
-            .map_err(|err| gstreamer::error_msg!(gstreamer::CoreError::Failed, ("{:#?}", err)))?;
+        let device_handle = device.open().map_err(|err| {
+            gstreamer::error_msg!(
+                gstreamer::CoreError::Failed,
+                ("Could not open device. Error: {:#?}", err)
+            )
+        })?;
 
         gstreamer::info!(
             CAT,

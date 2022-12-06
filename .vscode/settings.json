@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.checkOnSave.allTargets": true,
+    "rust-analyzer.checkOnSave.features": "all",
+    "rust-analyzer.cargo.features": "all",
+}
