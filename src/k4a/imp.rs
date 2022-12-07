@@ -255,10 +255,11 @@ impl ElementImpl for K4a {
             let pad_template = gstreamer::PadTemplate::new(
                 "src",
                 gstreamer::PadDirection::Src,
-                gstreamer::PadPresence::Sometimes,
+                gstreamer::PadPresence::Always,
                 &caps,
-            ).unwrap();
-            
+            )
+            .unwrap();
+
             vec![pad_template]
         });
         PAD_TEMPLATES.as_ref()

@@ -12,6 +12,7 @@ gstreamer-base = "0.19.3"
 gstreamer-video = "0.19.3"
 libc = "0.2.138"
 once_cell = "1.16.0"
+rayon = "1.6.0"
 strum = "0.24.1"
 strum_macros = "0.24.3"
 
@@ -28,6 +29,7 @@ opt-level = 3
 opt-level = 3
 
 [features]
-default = ["theta"]
+default = ["theta", "dcolorizer"]
 k4a = []
 theta = []
+dcolorizer = []

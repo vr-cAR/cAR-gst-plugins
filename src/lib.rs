@@ -1,3 +1,5 @@
+#[cfg(feature = "dcolorizer")]
+mod dcolorizer;
 mod frame;
 #[cfg(feature = "k4a")]
 mod k4a;
@@ -26,5 +28,7 @@ fn plugin_init(plugin: &gstreamer::Plugin) -> Result<(), Box<dyn Error>> {
     theta::register(plugin)?;
     #[cfg(feature = "k4a")]
     k4a::register(plugin)?;
+    #[cfg(feature = "dcolorizer")]
+    dcolorizer::register(plugin)?;
     Ok(())
 }
