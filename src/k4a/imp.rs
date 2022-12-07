@@ -1,7 +1,8 @@
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::{str::FromStr, sync::RwLock, time::Duration};
 
-use gstreamer::{glib, prelude::*, subclass::prelude::*, Caps};
+use gstreamer::{glib, prelude::*, subclass::prelude::*};
 use gstreamer_base::{
     subclass::{base_src::CreateSuccess, prelude::*},
     traits::BaseSrcExt,
@@ -114,6 +115,21 @@ impl K4a {
             .field("format", VideoFormat::Gray16Le.to_str().to_owned())
             .build()
     }
+
+    fn add_fields_to_caps(&self, caps: &mut gstreamer::CapsRef) {
+        let (width, height, fps) = {
+            let settings = self.settings.read().unwrap();
+            let (width, height) = settings.resolution();
+            let fps = settings.fps_mode.fps();
+            (width, height, gstreamer::Fraction::new(fps * 1000, 1001))
+        };
+        caps.map_in_place(|_features, structure| {
+            structure.set("width", width);
+            structure.set("height", height);
+            structure.set("framerate", fps);
+            ControlFlow::Continue(())
+        });
+    }
 }
 
 #[glib::object_subclass]
@@ -144,12 +160,13 @@ impl ObjectImpl for K4a {
                             .blurb("The FPS to read from the camera")
                             .build()
                     }
-                    SettingField::ColorResolution => {
-                        glib::ParamSpecEnum::builder(setting.into(), Settings::default().color_resolution)
-                            .nick("Color Resolution")
-                            .blurb("The color resolution to read from the camera")
-                            .build()
-                    }
+                    SettingField::ColorResolution => glib::ParamSpecEnum::builder(
+                        setting.into(),
+                        Settings::default().color_resolution,
+                    )
+                    .nick("Color Resolution")
+                    .blurb("The color resolution to read from the camera")
+                    .build(),
                     SettingField::DepthMode => {
                         glib::ParamSpecEnum::builder(setting.into(), Settings::default().depth_mode)
                             .nick("Depth Mode")
@@ -233,18 +250,16 @@ impl ElementImpl for K4a {
 
     fn pad_templates() -> &'static [gstreamer::PadTemplate] {
         static PAD_TEMPLATES: Lazy<Vec<gstreamer::PadTemplate>> = Lazy::new(|| {
-            [K4a::ir_depth_caps(), K4a::color_caps()]
-                .into_iter()
-                .map(|caps| {
-                    gstreamer::PadTemplate::new(
-                        "src",
-                        gstreamer::PadDirection::Src,
-                        gstreamer::PadPresence::Always,
-                        &caps,
-                    )
-                    .unwrap()
-                })
-                .collect()
+            let mut caps = K4a::ir_depth_caps();
+            caps.merge(K4a::color_caps());
+            let pad_template = gstreamer::PadTemplate::new(
+                "src",
+                gstreamer::PadDirection::Src,
+                gstreamer::PadPresence::Sometimes,
+                &caps,
+            ).unwrap();
+            
+            vec![pad_template]
         });
         PAD_TEMPLATES.as_ref()
     }
@@ -294,7 +309,7 @@ impl BaseSrcImpl for K4a {
             Mode::Color => Self::color_caps(),
             Mode::Ir | Mode::Depth => Self::ir_depth_caps(),
         };
-        if let Some(filter) = filter {
+        let mut result = if let Some(filter) = filter {
             if filter.can_intersect(&to_match) {
                 Some(to_match.intersect(filter))
             } else {
@@ -302,6 +317,23 @@ impl BaseSrcImpl for K4a {
             }
         } else {
             Some(to_match)
+        };
+        if let Some(caps) = result.as_mut() {
+            self.add_fields_to_caps(caps.make_mut());
+        }
+        result
+    }
+
+    fn set_caps(&self, caps: &gstreamer::Caps) -> Result<(), gstreamer::LoggableError> {
+        if let Some(caps) = self.caps(Some(caps)) {
+            self.parent_set_caps(&caps)?;
+            self.state.write().unwrap().cap_to_use.replace(caps);
+            Ok(())
+        } else {
+            Err(gstreamer::loggable_error!(
+                CAT,
+                "Could not set caps to incompatible type"
+            ))
         }
     }
 
@@ -450,30 +482,15 @@ impl BaseSrcImpl for K4a {
                 true
             }
             gstreamer::QueryViewMut::Caps(caps_query) => {
-                if let Some(Ok(format)) = self.caps(
-                    caps_query.filter().map(|cap| cap.to_owned()).as_ref()
-                ).and_then(|caps| {
-                    caps
-                        .structure(0)
-                        .map(|structure_ref| structure_ref.get::<String>("format"))
-                }) {
-                    let format: VideoFormat = VideoFormat::from_string(
-                        &format,
-                    );
-                    let (width, height, fps) = {
-                        let settings = self.settings.read().unwrap();
-                        let (width, height) = settings.resolution();
-                        let fps = settings.fps_mode.fps();
-                        (width, height, fps)
-                    };
-                    let caps = Caps::builder("video/x-raw")
-                        .field("format", format.to_str().to_owned())
-                        .field("width", width)
-                        .field("height", height)
-                        .field("framerate", gstreamer::Fraction::new(fps * 1000, 1001))
-                        .build();
-                    self.state.write().unwrap().cap_to_use.replace(caps);
-                    caps_query.set_result(self.state.read().unwrap().cap_to_use.clone().as_ref());
+                if let Some(caps) =
+                    self.caps(caps_query.filter().map(|cap| cap.to_owned()).as_ref())
+                {
+                    if self.set_caps(&caps).is_ok() {
+                        caps_query
+                            .set_result(self.state.read().unwrap().cap_to_use.clone().as_ref());
+                    } else {
+                        caps_query.set_result(None);
+                    }
                 } else {
                     caps_query.set_result(None);
                 }
@@ -489,7 +506,6 @@ impl PushSrcImpl for K4a {
         &self,
         _buffer: Option<&mut gstreamer::BufferRef>,
     ) -> Result<CreateSuccess, gstreamer::FlowError> {
-
         let (mode, fps) = {
             let settings = self.settings.read().unwrap();
             (settings.mode, settings.fps_mode.fps())
