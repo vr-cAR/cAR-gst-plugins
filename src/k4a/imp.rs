@@ -32,9 +32,9 @@ struct Settings {
 }
 
 impl Settings {
-    const IR_PASSIVE_RESOLUTION: (u32, u32) = (1024, 1024);
+    const IR_PASSIVE_RESOLUTION: (i32, i32) = (1024, 1024);
 
-    fn resolution(&self) -> (u32, u32) {
+    fn resolution(&self) -> (i32, i32) {
         match self.mode {
             Mode::Color => self.color_resolution.dimensions(),
             Mode::Ir => Self::IR_PASSIVE_RESOLUTION,
@@ -70,14 +70,14 @@ enum StreamState {
 
 struct State {
     camera: Option<StreamState>,
-    format_to_use: Option<VideoFormat>,
+    cap_to_use: Option<gstreamer::Caps>,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
             camera: None,
-            format_to_use: None,
+            cap_to_use: None,
         }
     }
 }
@@ -93,17 +93,17 @@ impl K4a {
         gstreamer::Caps::builder_full()
             .structure(
                 gstreamer::Structure::builder("video/x-raw")
-                    .field("format", VideoFormat::Bgra)
+                    .field("format", VideoFormat::Bgra.to_str().to_owned())
                     .build(),
             )
             .structure(
                 gstreamer::Structure::builder("video/x-raw")
-                    .field("format", VideoFormat::Yuy2)
+                    .field("format", VideoFormat::Yuy2.to_str().to_owned())
                     .build(),
             )
             .structure(
                 gstreamer::Structure::builder("video/x-raw")
-                    .field("format", VideoFormat::Nv12)
+                    .field("format", VideoFormat::Nv12.to_str().to_owned())
                     .build(),
             )
             .build()
@@ -111,7 +111,7 @@ impl K4a {
 
     fn ir_depth_caps() -> gstreamer::Caps {
         gstreamer::Caps::builder("video/x-raw")
-            .field("format", VideoFormat::Gray16Le)
+            .field("format", VideoFormat::Gray16Le.to_str().to_owned())
             .build()
     }
 }
@@ -145,19 +145,19 @@ impl ObjectImpl for K4a {
                             .build()
                     }
                     SettingField::ColorResolution => {
-                        glib::ParamSpecEnum::builder(setting.into(), Settings::default().fps_mode)
+                        glib::ParamSpecEnum::builder(setting.into(), Settings::default().color_resolution)
                             .nick("Color Resolution")
                             .blurb("The color resolution to read from the camera")
                             .build()
                     }
                     SettingField::DepthMode => {
-                        glib::ParamSpecEnum::builder(setting.into(), Settings::default().fps_mode)
+                        glib::ParamSpecEnum::builder(setting.into(), Settings::default().depth_mode)
                             .nick("Depth Mode")
                             .blurb("The depth mode to read from the camera")
                             .build()
                     }
                     SettingField::Mode => {
-                        glib::ParamSpecEnum::builder(setting.into(), Settings::default().fps_mode)
+                        glib::ParamSpecEnum::builder(setting.into(), Settings::default().mode)
                             .nick("Mode")
                             .blurb("What image type to read from the camera")
                             .build()
@@ -279,18 +279,20 @@ impl ElementImpl for K4a {
 impl BaseSrcImpl for K4a {
     fn negotiate(&self) -> Result<(), gstreamer::LoggableError> {
         let state = self.state.read().unwrap();
-        state
-            .format_to_use
-            .map(|_vf| ())
-            .ok_or(gstreamer::loggable_error!(CAT, "Failed to negotiate caps",))
+        if let Some(caps) = state.cap_to_use.as_ref() {
+            self.instance()
+                .set_caps(caps)
+                .map_err(|_| gstreamer::loggable_error!(CAT, "Failed to negotiate caps",))
+        } else {
+            Err(gstreamer::loggable_error!(CAT, "Failed to negotiate caps",))
+        }
     }
 
     fn caps(&self, filter: Option<&gstreamer::Caps>) -> Option<gstreamer::Caps> {
         let mode = self.settings.read().unwrap().mode;
         let to_match = match mode {
             Mode::Color => Self::color_caps(),
-            Mode::Ir => Self::ir_depth_caps(),
-            Mode::Depth => todo!(),
+            Mode::Ir | Mode::Depth => Self::ir_depth_caps(),
         };
         if let Some(filter) = filter {
             if filter.can_intersect(&to_match) {
@@ -303,38 +305,12 @@ impl BaseSrcImpl for K4a {
         }
     }
 
-    fn set_caps(&self, caps: &gstreamer::Caps) -> Result<(), gstreamer::LoggableError> {
-        if let Some(structure) = self
-            .caps(Some(caps))
-            .map(|caps| caps.structure(0).map(|structure| structure.to_owned()))
-            .flatten()
-        {
-            let format: VideoFormat = structure
-                .get("format")
-                .map_err(|_| gstreamer::loggable_error!(CAT, "Failed to set caps"))?;
-            let (width, height) = self.settings.read().unwrap().resolution();
-            let caps = Caps::builder(structure.name())
-                .field("format", format)
-                .field("width", width)
-                .field("height", height)
-                .build();
-
-            self.instance()
-                .set_caps(&caps)
-                .map_err(|_| gstreamer::loggable_error!(CAT, "Failed to set caps",))?;
-
-            self.state.write().unwrap().format_to_use.replace(format);
-
-            Ok(())
-        } else {
-            Err(gstreamer::loggable_error!(CAT, "Failed to set caps"))
-        }
-    }
-
     fn start(&self) -> Result<(), gstreamer::ErrorMessage> {
         let settings = self.settings.read().unwrap().clone();
         let mut state = self.state.write().unwrap();
-        let Some(format) = state.format_to_use else {
+        let Some(format) = state.cap_to_use.as_ref().and_then(|caps| caps.structure(0)).and_then(|structure| structure.get::<String>("format").ok()).map(
+            |format| VideoFormat::from_string(&format)
+        ) else {
             return Err(gstreamer::error_msg!(
                 gstreamer::CoreError::Negotiation,
                 ("Unknown caps.")
@@ -379,19 +355,13 @@ impl BaseSrcImpl for K4a {
                 (format, resolution, depth_mode)
             }
             Mode::Ir => {
-                let format = match format {
-                    VideoFormat::Gray16Le => libk4a::sys::k4a_image_format_t::K4A_IMAGE_FORMAT_IR16,
-                    _ => unreachable!(),
-                };
+                let format = libk4a::sys::k4a_image_format_t::K4A_IMAGE_FORMAT_COLOR_MJPG; // default value for disabled
                 let resolution = libk4a::sys::k4a_color_resolution_t::K4A_COLOR_RESOLUTION_OFF;
                 let depth_mode = libk4a::sys::k4a_depth_mode_t::K4A_DEPTH_MODE_PASSIVE_IR;
                 (format, resolution, depth_mode)
             }
             Mode::Depth => {
-                let format = match format {
-                    VideoFormat::Gray16Le => libk4a::sys::k4a_image_format_t::K4A_IMAGE_FORMAT_IR16,
-                    _ => unreachable!(),
-                };
+                let format = libk4a::sys::k4a_image_format_t::K4A_IMAGE_FORMAT_COLOR_MJPG; // default value for disabled
                 let resolution = libk4a::sys::k4a_color_resolution_t::K4A_COLOR_RESOLUTION_OFF;
                 let depth_mode = match settings.depth_mode {
                     DepthMode::NormalFov2x2Binned => {
@@ -479,9 +449,34 @@ impl BaseSrcImpl for K4a {
                 );
                 true
             }
-            gstreamer::QueryViewMut::Caps(caps) => {
-                let to_use = self.caps(caps.filter().map(|r| r.to_owned()).as_ref());
-                caps.set_result(to_use.as_ref());
+            gstreamer::QueryViewMut::Caps(caps_query) => {
+                if let Some(Ok(format)) = self.caps(
+                    caps_query.filter().map(|cap| cap.to_owned()).as_ref()
+                ).and_then(|caps| {
+                    caps
+                        .structure(0)
+                        .map(|structure_ref| structure_ref.get::<String>("format"))
+                }) {
+                    let format: VideoFormat = VideoFormat::from_string(
+                        &format,
+                    );
+                    let (width, height, fps) = {
+                        let settings = self.settings.read().unwrap();
+                        let (width, height) = settings.resolution();
+                        let fps = settings.fps_mode.fps();
+                        (width, height, fps)
+                    };
+                    let caps = Caps::builder("video/x-raw")
+                        .field("format", format.to_str().to_owned())
+                        .field("width", width)
+                        .field("height", height)
+                        .field("framerate", gstreamer::Fraction::new(fps * 1000, 1001))
+                        .build();
+                    self.state.write().unwrap().cap_to_use.replace(caps);
+                    caps_query.set_result(self.state.read().unwrap().cap_to_use.clone().as_ref());
+                } else {
+                    caps_query.set_result(None);
+                }
                 true
             }
             _ => BaseSrcImplExt::parent_query(self, query),
@@ -494,6 +489,7 @@ impl PushSrcImpl for K4a {
         &self,
         _buffer: Option<&mut gstreamer::BufferRef>,
     ) -> Result<CreateSuccess, gstreamer::FlowError> {
+
         let (mode, fps) = {
             let settings = self.settings.read().unwrap();
             (settings.mode, settings.fps_mode.fps())
@@ -516,16 +512,25 @@ impl PushSrcImpl for K4a {
             gstreamer::FlowError::Error
         })?;
 
-        let image = capture.get_image(image_type).ok_or_else(|| {
+        let Some(image) = capture.get_image(image_type) else {
             gstreamer::element_imp_error!(
                 self,
                 gstreamer::CoreError::Failed,
                 ("Could not get image from capture.")
             );
-            gstreamer::FlowError::Error
-        })?;
+            return Err(gstreamer::FlowError::Error);
+        };
 
-        let mut buffer = gstreamer::Buffer::with_size(image.buffer().len()).map_err(|err| {
+        let Some(image_bytes) = image.buffer() else {
+            gstreamer::element_imp_error!(
+                self,
+                gstreamer::CoreError::Failed,
+                ("Could not get raw pixels from image.")
+            );
+            return Err(gstreamer::FlowError::Error);
+        };
+
+        let mut buffer = gstreamer::Buffer::with_size(image_bytes.len()).map_err(|err| {
             gstreamer::element_imp_error!(
                 self,
                 gstreamer::CoreError::Failed,
@@ -545,7 +550,7 @@ impl PushSrcImpl for K4a {
                 );
                 gstreamer::FlowError::Error
             })?
-            .copy_from_slice(image.buffer());
+            .copy_from_slice(image_bytes);
 
         let start_timestamp = self
             .frame_data
@@ -567,6 +572,15 @@ impl PushSrcImpl for K4a {
                 duration.as_nanos() as u64
             ));
 
+        gstreamer::debug!(
+            CAT,
+            imp: self,
+            "Got frame from camera. pts={:?}, dts={:?}, duration={:?}",
+            buffer.as_ref().pts(),
+            buffer.as_ref().dts(),
+            buffer.as_ref().duration()
+        );
+
         Ok(CreateSuccess::NewBuffer(buffer))
     }
 }
@@ -581,7 +595,7 @@ enum FpsMode {
 }
 
 impl FpsMode {
-    fn fps(&self) -> usize {
+    fn fps(&self) -> i32 {
         match self {
             FpsMode::Fps5 => 5,
             FpsMode::Fps15 => 15,
@@ -603,7 +617,7 @@ enum ColorResolution {
 }
 
 impl ColorResolution {
-    fn dimensions(&self) -> (u32, u32) {
+    fn dimensions(&self) -> (i32, i32) {
         match self {
             Self::Res720P => (1280, 720),
             Self::Res1080P => (1920, 1080),
@@ -626,7 +640,7 @@ enum DepthMode {
 }
 
 impl DepthMode {
-    fn dimensions(&self) -> (u32, u32) {
+    fn dimensions(&self) -> (i32, i32) {
         match self {
             Self::NormalFov2x2Binned => (320, 288),
             Self::NormalFovUnbinned => (640, 576),

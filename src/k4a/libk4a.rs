@@ -193,11 +193,17 @@ impl Image {
         }
     }
 
-    pub fn buffer(&self) -> &[u8] {
+    pub fn buffer(&self) -> Option<&[u8]> {
         unsafe {
-            let ptr = NonNull::new(sys::k4a_image_get_buffer(self.image.as_ptr())).unwrap();
+            let Some(ptr) = NonNull::new(sys::k4a_image_get_buffer(self.image.as_ptr())) else {
+                return None;
+            };
             let size = sys::k4a_image_get_size(self.image.as_ptr());
-            std::slice::from_raw_parts(ptr.as_ptr(), size)
+            if size > 0 {
+                Some(std::slice::from_raw_parts(ptr.as_ptr(), size))
+            } else {
+                None
+            }
         }
     }
 
