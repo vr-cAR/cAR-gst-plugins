@@ -294,11 +294,13 @@ impl ElementImpl for K4a {
 
 impl BaseSrcImpl for K4a {
     fn negotiate(&self) -> Result<(), gstreamer::LoggableError> {
-        let state = self.state.read().unwrap();
-        if let Some(caps) = state.cap_to_use.as_ref() {
-            self.instance()
-                .set_caps(caps)
-                .map_err(|_| gstreamer::loggable_error!(CAT, "Failed to negotiate caps",))
+        let cap_used = {
+            self.state.read().unwrap().cap_to_use.clone()
+        };
+        if let Some(caps) = cap_used {
+            let res = self.set_caps(&caps)
+                .map_err(|_| gstreamer::loggable_error!(CAT, "Failed to negotiate caps",));
+            Ok(())
         } else {
             Err(gstreamer::loggable_error!(CAT, "Failed to negotiate caps",))
         }
@@ -483,18 +485,18 @@ impl BaseSrcImpl for K4a {
                 true
             }
             gstreamer::QueryViewMut::Caps(caps_query) => {
-                if let Some(caps) =
+                let mut result = if let Some(caps) =
                     self.caps(caps_query.filter().map(|cap| cap.to_owned()).as_ref())
                 {
                     if self.set_caps(&caps).is_ok() {
-                        caps_query
-                            .set_result(self.state.read().unwrap().cap_to_use.clone().as_ref());
+                        self.state.read().unwrap().cap_to_use.clone()
                     } else {
-                        caps_query.set_result(None);
+                        None
                     }
                 } else {
-                    caps_query.set_result(None);
-                }
+                    None
+                };
+                caps_query.set_result(result.as_ref());
                 true
             }
             _ => BaseSrcImplExt::parent_query(self, query),
